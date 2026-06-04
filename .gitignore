@@ -1,0 +1,13 @@
+.env
+chat_memory.json
+permanent_memory.json
+*.log
+*.tmp
+__pycache__/
+*.pyc
+ngrok.exe
+cloudflared.exe
+start_bot_watchdog.bat
+start_cloudflared_watchdog.bat
+error_detail.log
+bot_*.log
