@@ -1,0 +1,4 @@
+{
+  "build_command": "pip install -r requirements.txt",
+  "start_command": "python -X utf8 cloud_bot.py"
+}
