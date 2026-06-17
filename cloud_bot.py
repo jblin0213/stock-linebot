@@ -341,14 +341,10 @@ def webhook():
                 except Exception: pass
                 try:
                     ans = chat_ai(u, m)
-                    # 先嘗試 reply（20s token），失敗就 push
-                    try:
-                        reply_line(tk, ans)
-                    except Exception:
-                        push_line(u, ans)
                 except Exception as e:
-                    print(f'[proc] {type(e).__name__}: {e}')
-                    push_line(u, f'❌ 處理失敗：{type(e).__name__}')
+                    ans = f'❌ AI 處理失敗：{type(e).__name__}: {str(e)[:60]}'
+                # 直接用 push（AI 需要 25s，reply token 早就過期）
+                push_line(u, ans)
             threading.Thread(target=proc, args=(uid,token,text), daemon=True).start()
     return 'OK', 200
 
