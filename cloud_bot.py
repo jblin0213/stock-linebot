@@ -333,7 +333,6 @@ def webhook():
             token = ev.get('replyToken','')
             text = ev['message']['text'].strip()
             def proc(u, tk, m):
-                # 思考動畫
                 try:
                     requests.post('https://api.line.me/v2/bot/chat/loading/start',
                         headers={'Authorization':f'Bearer {LINE_TOKEN}','Content-Type':'application/json'},
@@ -343,9 +342,48 @@ def webhook():
                     ans = chat_ai(u, m)
                 except Exception as e:
                     ans = f'❌ AI 處理失敗：{type(e).__name__}: {str(e)[:60]}'
-                # 直接用 push（AI 需要 25s，reply token 早就過期）
                 push_line(u, ans)
             threading.Thread(target=proc, args=(uid,token,text), daemon=True).start()
+
+        elif ev.get('type')=='message' and ev.get('message',{}).get('type')=='image':
+            uid = ev['source'].get('userId','')
+            msg_id = ev['message']['id']
+            def proc_image(u, mid):
+                try:
+                    requests.post('https://api.line.me/v2/bot/chat/loading/start',
+                        headers={'Authorization':f'Bearer {LINE_TOKEN}','Content-Type':'application/json'},
+                        json={'chatId':u,'loadingSeconds':40}, timeout=5)
+                except Exception: pass
+                try:
+                    # 從 LINE 下載圖片
+                    img_resp = requests.get(
+                        f'https://api-data.line.me/v2/bot/message/{mid}/content',
+                        headers={'Authorization':f'Bearer {LINE_TOKEN}'}, timeout=15)
+                    import base64
+                    img_b64 = base64.standard_b64encode(img_resp.content).decode()
+                    mime = img_resp.headers.get('Content-Type','image/jpeg').split(';')[0]
+
+                    # 傳給 Claude Vision 分析
+                    import anthropic
+                    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+                    ctx = build_context()
+                    perm = load_permanent()
+                    perm_txt = ('\n\n【永久記憶】\n' + '\n'.join(f'• {p["content"]}' for p in perm)) if perm else ''
+                    system = f'{SYSTEM_PROMPT}\n\n【即時資料】\n{ctx}{perm_txt}'
+                    resp = client.messages.create(
+                        model='claude-sonnet-4-6',
+                        max_tokens=800,
+                        system=system,
+                        messages=[{'role':'user','content':[
+                            {'type':'image','source':{'type':'base64','media_type':mime,'data':img_b64}},
+                            {'type':'text','text':'請分析這張K線圖或股票截圖，給出專業的技術分析意見。包括：趨勢、支撐壓力、型態、建議操作方向。'}
+                        ]}]
+                    )
+                    ans = resp.content[0].text
+                except Exception as e:
+                    ans = f'❌ 圖片分析失敗：{type(e).__name__}: {str(e)[:80]}'
+                push_line(u, ans)
+            threading.Thread(target=proc_image, args=(uid,msg_id), daemon=True).start()
     return 'OK', 200
 
 @app.route('/health')
