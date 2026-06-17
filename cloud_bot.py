@@ -251,6 +251,36 @@ def chat_ai(uid, msg):
     if msg in ['清除','重置','/reset']:
         sb_delete('stock_memory', f'user_id=eq.{uid}')
         return '✅ 對話記憶已清除！'
+    # 停止訂閱警報：「停止訂 6194 1471」
+    if msg.startswith('停止訂') or msg.startswith('取消警報') or msg.startswith('取消訂'):
+        import re
+        codes = re.findall(r'\d{4}', msg)
+        if codes:
+            removed = []
+            for code in codes:
+                sb_delete('stock_alert', f'code=eq.{code}')
+                _alert_fired.discard(next((k for k in list(_alert_fired) if k.startswith(code+'_')), ''))
+                removed.append(code)
+            # 清除 _alert_fired 中相關的
+            for key in list(_alert_fired):
+                if any(key.startswith(c+'_') for c in codes):
+                    _alert_fired.discard(key)
+            remaining = sb_get('stock_alert', 'select=code,alert_price,direction,memo&active=eq.true')
+            rem_txt = '\n'.join([f"• {a['code']} {a.get('direction','')} {a.get('alert_price','')} {a.get('memo','')}" for a in remaining]) or '（無）'
+            return f"✅ 已從資料庫移除警報：{', '.join(removed)}\n\n📋 剩餘警報：\n{rem_txt}"
+        return '⚠️ 請指定股票代碼，例如：停止訂 6194 1471'
+
+    # 查看所有警報：「警報清單」
+    if msg in ['警報清單','我的警報','訂閱清單','監控清單']:
+        alerts = sb_get('stock_alert', 'select=code,alert_price,direction,memo&active=eq.true')
+        if not alerts:
+            return '📋 目前沒有設定任何警報'
+        lines = ['📋 目前警報清單：']
+        for a in alerts:
+            d = '跌至' if a.get('direction')=='below' else '漲至'
+            lines.append(f"• {a['code']} {d} {a.get('alert_price','')} {a.get('memo','')}")
+        return '\n'.join(lines)
+
     if msg.startswith('記住：') or msg.startswith('記住:'):
         content = msg.split('：',1)[-1].split(':',1)[-1].strip()
         sb_upsert('stock_permanent', {'content': content,
