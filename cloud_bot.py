@@ -175,7 +175,12 @@ def us_market_open():
 # ══════════════════════════════════════════════════════
 # 系統上下文（給 AI）
 # ══════════════════════════════════════════════════════
+_ctx_cache = {'ts': 0, 'data': ''}
 def build_context():
+    # 快取 60 秒，避免每次重打 API 超時
+    global _ctx_cache
+    if time.time() - _ctx_cache['ts'] < 60 and _ctx_cache['data']:
+        return _ctx_cache['data']
     ctx = []
     now = datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M')
     us_open = us_market_open()
@@ -216,7 +221,10 @@ def build_context():
     else:
         ctx.append('\n【持股】尚未登記')
 
-    return '\n'.join(ctx)
+    result = '\n'.join(ctx)
+    _ctx_cache['ts'] = time.time()
+    _ctx_cache['data'] = result
+    return result
 
 SYSTEM_PROMPT = """你是JV大人的私人股票AI顧問「比董」，透過LINE即時對話。
 
@@ -294,14 +302,18 @@ def reply_line(token, text):
     except Exception as e:
         print(f'[LINE] reply 失敗: {e}')
 
-def push_owner(text):
+def push_line(uid, text):
     if not LINE_TOKEN: return
+    chunks = [text[i:i+2000] for i in range(0, min(len(text),6000), 2000)]
     try:
         requests.post('https://api.line.me/v2/bot/message/push',
             headers={'Authorization':f'Bearer {LINE_TOKEN}','Content-Type':'application/json'},
-            json={'to':OWNER_UID,'messages':[{'type':'text','text':text}]}, timeout=10)
+            json={'to':uid,'messages':[{'type':'text','text':c} for c in chunks]}, timeout=10)
     except Exception as e:
         print(f'[LINE] push 失敗: {e}')
+
+def push_owner(text):
+    push_line(OWNER_UID, text)
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -325,13 +337,18 @@ def webhook():
                 try:
                     requests.post('https://api.line.me/v2/bot/chat/loading/start',
                         headers={'Authorization':f'Bearer {LINE_TOKEN}','Content-Type':'application/json'},
-                        json={'chatId':u,'loadingSeconds':20}, timeout=5)
+                        json={'chatId':u,'loadingSeconds':30}, timeout=5)
                 except Exception: pass
                 try:
-                    reply_line(tk, chat_ai(u, m))
+                    ans = chat_ai(u, m)
+                    # 先嘗試 reply（20s token），失敗就 push
+                    try:
+                        reply_line(tk, ans)
+                    except Exception:
+                        push_line(u, ans)
                 except Exception as e:
                     print(f'[proc] {type(e).__name__}: {e}')
-                    reply_line(tk, f'❌ 處理失敗：{type(e).__name__}')
+                    push_line(u, f'❌ 處理失敗：{type(e).__name__}')
             threading.Thread(target=proc, args=(uid,token,text), daemon=True).start()
     return 'OK', 200
 
