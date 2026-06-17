@@ -373,20 +373,92 @@ def morning_briefing():
     return '\n'.join(lines)
 
 _sent_morning = set()
-_alert_fired = set()
+_sent_health  = set()
+_alert_fired  = set()
+_self_url     = None   # 啟動後自動偵測
+
+def self_ping():
+    """自我保活：每10分鐘 ping 自己，防止 Zeabur 閒置睡著"""
+    global _self_url
+    if not _self_url:
+        port = int(os.environ.get('PORT', 8090))
+        _self_url = f'http://localhost:{port}/health'
+    try:
+        requests.get(_self_url, timeout=5)
+        print('[keep-alive] ping ok')
+    except Exception as e:
+        print(f'[keep-alive] ping 失敗: {e}')
+
+def health_check():
+    """每天早上 06:00 自我健診，把結果推給大人"""
+    errors = []
+    ok     = []
+
+    # 1. Fugle 報價
+    try:
+        q = fugle_quote('2330')
+        if q and q['price'] > 0:
+            ok.append(f'✅ Fugle API：台積電 {q["price"]}')
+        else:
+            errors.append('❌ Fugle API：報價異常')
+    except Exception as e:
+        errors.append(f'❌ Fugle API：{str(e)[:40]}')
+
+    # 2. Supabase 連線
+    try:
+        port = sb_get('portfolio', 'select=code&limit=1')
+        ok.append('✅ Supabase：連線正常')
+    except Exception as e:
+        errors.append(f'❌ Supabase：{str(e)[:40]}')
+
+    # 3. Anthropic API
+    try:
+        import anthropic
+        c = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        r = c.messages.create(model='claude-haiku-4-5-20251001',
+                              max_tokens=5, messages=[{'role':'user','content':'hi'}])
+        ok.append('✅ Anthropic API：正常')
+    except Exception as e:
+        errors.append(f'❌ Anthropic API：{str(e)[:40]}')
+
+    # 4. 環境變數
+    if not LINE_TOKEN:  errors.append('❌ LINE Token 未設定')
+    else:               ok.append('✅ LINE Token：已設定')
+
+    status = '🟢 全部正常' if not errors else f'🔴 發現 {len(errors)} 個問題'
+    lines  = [f'🤖 比董健康檢查 {datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M")}',
+              '━━━━━━━━━━━━', status, '']
+    lines += ok
+    if errors:
+        lines += [''] + errors
+        lines += ['', '⚠️ 請通知克勞弟查看 Zeabur 環境設定']
+    push_owner('\n'.join(lines))
 
 def scheduler():
-    print('[排程] 晨報+警報排程啟動')
+    print('[排程] 晨報+警報+保活排程啟動')
+    _last_ping = 0
     while True:
         try:
-            now = datetime.now(TW_TZ)
+            now   = datetime.now(TW_TZ)
             today = now.strftime('%Y%m%d')
-            hhmm = now.strftime('%H:%M')
-            # 晨報 08:50
+            hhmm  = now.strftime('%H:%M')
+
+            # 自我保活：每10分鐘 ping 一次（防 Zeabur 睡著）
+            if time.time() - _last_ping >= 600:
+                _last_ping = time.time()
+                threading.Thread(target=self_ping, daemon=True).start()
+
+            # 每天 06:00 健康診斷
+            if hhmm == '06:00' and today not in _sent_health:
+                _sent_health.add(today)
+                threading.Thread(target=health_check, daemon=True).start()
+
+            # 晨報 08:50（平日）
             if hhmm == '08:50' and now.weekday() < 5 and today not in _sent_morning:
                 _sent_morning.add(today)
                 try: push_owner(morning_briefing())
                 except Exception as e: print(f'[晨報] {e}')
+
             # 價格警報（盤中每次檢查）
             if 9 <= now.hour <= 13 and now.weekday() < 5:
                 for a in sb_get('stock_alert', 'select=*&active=eq.true'):
