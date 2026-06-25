@@ -522,8 +522,8 @@ def daily_portfolio_report():
 
 
 def setup_portfolio_alerts():
-    """根據持股自動設定跌破支撐警報"""
-    print('[防守] 設定持股跌破警報...')
+    """根據持股自動設定兩層防守警報：MA8（示警）+ 均價（停損）"""
+    print('[防守] 設定持股兩層防守警報...')
     holdings = sb_get('stock_portfolio', 'select=*')
     count = 0
     for h in holdings:
@@ -537,27 +537,30 @@ def setup_portfolio_alerts():
             continue
 
         closes = [c['close'] for c in candles]
-        lows = [c['low'] for c in candles]
 
-        # 支撐位 = 近 20 日最低點
-        support = min(lows[-20:]) if len(lows) >= 20 else min(lows)
-        # MA21
-        ma21 = sum(closes[-21:]) / min(len(closes), 21)
-
-        # 取較高的那個當防守價（跌破 = 趨勢轉弱）
-        guard_price = round(max(support, ma21 * 0.98), 2)
-
+        # 第一層：MA8（短線轉弱示警）
+        ma8 = round(sum(closes[-8:]) / min(len(closes), 8), 2)
         sb_upsert('stock_alert', {
             'code': code,
-            'alert_price': guard_price,
+            'alert_price': ma8,
             'direction': 'below',
-            'memo': f'⚠️ 跌破支撐{guard_price}！考慮停損',
+            'memo': f'⚠️ 跌破MA8（{ma8}）短線轉弱，注意觀察',
             'active': True,
         })
-        count += 1
-        print(f'  {code} 防守價 {guard_price}')
 
-    print(f'[防守] 共設 {count} 支跌破警報')
+        # 第二層：均價（該停損了）
+        sb_upsert('stock_alert', {
+            'code': code,
+            'alert_price': avg,
+            'direction': 'below',
+            'memo': f'🚨 跌破均價{avg}！虧損中，認真考慮停損',
+            'active': True,
+        })
+
+        count += 1
+        print(f'  {code} 第一層MA8={ma8} 第二層均價={avg}')
+
+    print(f'[防守] 共設 {count} 支（每支兩層警報）')
 
 
 def taiex_quote():
