@@ -1038,14 +1038,19 @@ def scheduler():
                 _sent_scan.add(today)
                 threading.Thread(target=daily_breakout_scan, daemon=True).start()
 
+            # 每日 09:05 開盤速報（持股損益）
+            if hhmm == '09:05' and now.weekday() < 5 and today not in _sent_report:
+                _sent_report.add(today)
+                threading.Thread(target=daily_portfolio_report, daemon=True).start()
+
             # 每日 09:35 自動設定持股跌破支撐警報
             if hhmm == '09:35' and now.weekday() < 5 and today not in _sent_guard:
                 _sent_guard.add(today)
                 threading.Thread(target=setup_portfolio_alerts, daemon=True).start()
 
             # 每日 13:35 收盤損益日報
-            if hhmm == '13:35' and now.weekday() < 5 and today not in _sent_report:
-                _sent_report.add(today)
+            if hhmm == '13:35' and now.weekday() < 5 and f'{today}_close' not in _sent_report:
+                _sent_report.add(f'{today}_close')
                 threading.Thread(target=daily_portfolio_report, daemon=True).start()
 
             # 價格警報（盤中每次檢查）
