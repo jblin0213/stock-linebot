@@ -135,6 +135,289 @@ def fugle_ma(code):
         pass
     return {}
 
+def fugle_candles(code, limit=120):
+    """從 Fugle 抓歷史日K線，回傳 list[{date, open, high, low, close, volume}]，舊→新"""
+    try:
+        r = requests.get(f'https://api.fugle.tw/marketdata/v1.0/stock/historical/candles/{code}',
+                         headers=FUGLE_HEADERS, params={'timeframe': 'D', 'limit': limit}, timeout=10)
+        if r.status_code == 200:
+            data = r.json().get('data', [])
+            return list(reversed(data))
+    except Exception as e:
+        print(f'[Fugle candles] {code}: {e}')
+    return []
+
+def detect_triangle(code):
+    """偵測三角收斂型態，回傳上軌/下軌/突破點/現價/判斷"""
+    candles = fugle_candles(code, 120)
+    if len(candles) < 30:
+        return None
+
+    highs = [c['high'] for c in candles]
+    lows  = [c['low']  for c in candles]
+    close = candles[-1]['close']
+
+    # 找近 60 根 K 棒的波段高低點（至少間隔 5 根）
+    n = min(60, len(candles))
+    recent = candles[-n:]
+    rh = [c['high'] for c in recent]
+    rl = [c['low']  for c in recent]
+
+    # 找局部高點（前後各3根最高）
+    swing_highs = []
+    swing_lows  = []
+    for i in range(3, len(recent)-3):
+        if rh[i] == max(rh[i-3:i+4]):
+            swing_highs.append((i, rh[i]))
+        if rl[i] == min(rl[i-3:i+4]):
+            swing_lows.append((i, rl[i]))
+
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return None
+
+    # 用最後兩個高點畫下降趨勢線（上軌）
+    h1, h2 = swing_highs[-2], swing_highs[-1]
+    # 用最後兩個低點畫上升趨勢線（下軌）
+    l1, l2 = swing_lows[-2], swing_lows[-1]
+
+    # 判斷是否收斂：高點要越來越低，低點要越來越高
+    high_declining = h2[1] < h1[1]
+    low_rising     = l2[1] > l1[1]
+
+    if not (high_declining and low_rising):
+        # 不是三角收斂
+        return None
+
+    # 外推到今天（最後一根的位置 = n-1）
+    today_idx = n - 1
+    if h2[0] != h1[0]:
+        upper = h1[1] + (h2[1]-h1[1]) * (today_idx-h1[0]) / (h2[0]-h1[0])
+    else:
+        upper = h2[1]
+    if l2[0] != l1[0]:
+        lower = l1[1] + (l2[1]-l1[1]) * (today_idx-l1[0]) / (l2[0]-l1[0])
+    else:
+        lower = l2[1]
+
+    upper = round(upper, 2)
+    lower = round(lower, 2)
+
+    # 收斂幅度
+    spread = round((upper - lower) / close * 100, 1) if close else 0
+
+    # 判斷突破方向
+    if close > upper:
+        status = '🔥 已向上突破！'
+    elif close < lower:
+        status = '⚠️ 已向下跌破！'
+    elif spread < 3:
+        status = '⚡ 極度收斂中，即將變盤'
+    else:
+        status = '📐 收斂中，尚未突破'
+
+    q = fugle_quote(code)
+    name = q.get('name', code)
+
+    return {
+        'code': code, 'name': name, 'close': close,
+        'upper': upper, 'lower': lower, 'spread': spread,
+        'status': status,
+        'high_points': [h1, h2], 'low_points': [l1, l2],
+    }
+
+def auto_watch_triangle(code):
+    """偵測三角收斂並自動設定突破警報，回傳說明文字"""
+    result = detect_triangle(code)
+    if not result:
+        q = fugle_quote(code)
+        name = q.get('name', code) if q else code
+        return f'📐 {code} {name}\n目前沒有明顯的三角收斂型態。\n\n如果你有特定價位要監控，可以直接說：\n「{code} 突破 XX 元通知我」'
+
+    # 自動設定上軌突破警報
+    sb_upsert('stock_alert', {
+        'code':        result['code'],
+        'alert_price': result['upper'],
+        'direction':   'above',
+        'memo':        f"三角收斂向上突破（上軌{result['upper']}）",
+        'active':      True
+    })
+    # 自動設定下軌跌破警報
+    sb_upsert('stock_alert', {
+        'code':        result['code'],
+        'alert_price': result['lower'],
+        'direction':   'below',
+        'memo':        f"三角收斂向下跌破（下軌{result['lower']}）",
+        'active':      True
+    })
+
+    lines = [
+        f"📐 {result['code']} {result['name']} 三角收斂分析",
+        f"━━━━━━━━━━━━",
+        f"現價：{result['close']}",
+        f"上軌壓力：{result['upper']}",
+        f"下軌支撐：{result['lower']}",
+        f"收斂幅度：{result['spread']}%",
+        f"狀態：{result['status']}",
+        f"",
+        f"✅ 已自動設定警報：",
+        f"• 突破 {result['upper']} → 通知（做多訊號）",
+        f"• 跌破 {result['lower']} → 通知（停損訊號）",
+    ]
+    return '\n'.join(lines)
+
+def _ema(data, period):
+    k = 2 / (period + 1)
+    val = data[0]
+    for d in data[1:]:
+        val = d * k + val * (1 - k)
+    return val
+
+def detect_breakout_ready(code):
+    """偵測「蓄勢待發」：漲過一波→回檔不破→均線多排→量縮→接近前高
+    回傳 dict 或 None"""
+    candles = fugle_candles(code, 120)
+    if len(candles) < 60:
+        return None
+
+    closes  = [c['close'] for c in candles]
+    highs   = [c['high'] for c in candles]
+    lows    = [c['low'] for c in candles]
+    volumes = [c['volume'] for c in candles]
+    current = closes[-1]
+    today_vol = volumes[-1]
+
+    # 1. 均線多排 MA8 > MA21 > MA55 且全部向上
+    ma8  = sum(closes[-8:]) / 8
+    ma21 = sum(closes[-21:]) / 21
+    ma55 = sum(closes[-55:]) / 55
+    if not (ma8 > ma21 > ma55):
+        return None
+
+    # MA55 向上（跟 10 天前比）
+    if len(closes) >= 65:
+        ma55_10ago = sum(closes[-65:-10]) / 55
+        if ma55 <= ma55_10ago:
+            return None
+
+    # 2. MACD 零軸上方
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    dif = ema12 - ema26
+    if dif < 0:
+        return None
+
+    # 3. 找前高（近 30 天最高點）
+    recent_high = max(highs[-30:])
+
+    # 4. 現價接近前高但尚未突破（距離 0~5%）
+    dist_pct = round((recent_high - current) / current * 100, 1)
+    if dist_pct < -1 or dist_pct > 5:
+        return None
+
+    # 5. 量縮判定：近 5 天平均量 < 前 15 天平均量的 70%
+    if len(volumes) >= 20:
+        avg_vol_5  = sum(volumes[-5:]) / 5
+        avg_vol_15 = sum(volumes[-20:-5]) / 15
+        vol_shrink = avg_vol_5 < avg_vol_15 * 0.7
+    else:
+        vol_shrink = False
+
+    # 6. 第一攻存在：過去 60 天內有一段 ≥15% 的漲幅
+    min_60 = min(lows[-60:])
+    max_60 = max(highs[-60:])
+    first_wave = (max_60 - min_60) / min_60 * 100 if min_60 > 0 else 0
+    if first_wave < 15:
+        return None
+
+    q = fugle_quote(code)
+    name = q.get('name', code) if q else code
+
+    return {
+        'code': code, 'name': name,
+        'close': current, 'recent_high': recent_high,
+        'dist_pct': dist_pct,
+        'vol_shrink': vol_shrink,
+        'ma8': round(ma8, 2), 'ma21': round(ma21, 2), 'ma55': round(ma55, 2),
+        'macd_dif': round(dif, 2),
+        'first_wave_pct': round(first_wave, 1),
+        'today_vol': today_vol,
+    }
+
+def daily_breakout_scan():
+    """每日早盤自動掃描：找出蓄勢待發的股票，設突破警報"""
+    import urllib3; urllib3.disable_warnings()
+    print('[掃描] 開始每日蓄勢待發掃描...')
+
+    # 從 TWSE + TPEX 抓今日成交量前 100 名
+    stocks = []
+    try:
+        r = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL',
+                         timeout=15, verify=False)
+        for item in r.json():
+            code = item.get('Code','').strip()
+            vol  = item.get('TradeVolume','0').replace(',','')
+            try: vol_k = int(vol) // 1000
+            except: vol_k = 0
+            if code.isdigit() and len(code) == 4 and vol_k > 500:
+                stocks.append({'code': code, 'vol': vol_k})
+    except Exception as e:
+        print(f'[掃描] TWSE 失敗: {e}')
+    try:
+        r = requests.get('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes',
+                         timeout=15, verify=False)
+        for item in r.json():
+            code = item.get('SecuritiesCompanyCode','').strip()
+            vol  = item.get('TradeVolume','0').replace(',','')
+            try: vol_k = int(float(vol)) // 1000
+            except: vol_k = 0
+            if code.isdigit() and len(code) == 4 and vol_k > 500:
+                stocks.append({'code': code, 'vol': vol_k})
+    except Exception as e:
+        print(f'[掃描] TPEX 失敗: {e}')
+
+    stocks.sort(key=lambda s: s['vol'], reverse=True)
+    scan_list = [s['code'] for s in stocks[:100]]
+    print(f'[掃描] 掃描 {len(scan_list)} 支熱門股...')
+
+    ready = []
+    for i, code in enumerate(scan_list):
+        try:
+            r = detect_breakout_ready(code)
+            if r:
+                ready.append(r)
+                # 自動設定突破前高警報
+                sb_upsert('stock_alert', {
+                    'code': code,
+                    'alert_price': r['recent_high'],
+                    'direction': 'above',
+                    'memo': f"蓄勢待發！距前高{r['dist_pct']}%，{'量縮中' if r['vol_shrink'] else '量穩'}",
+                    'active': True,
+                })
+        except Exception as e:
+            print(f'[掃描] {code} 錯誤: {e}')
+        # 每 20 支暫停 3 秒，避免 Fugle API 限流
+        if (i + 1) % 20 == 0:
+            time.sleep(3)
+
+    print(f'[掃描] 完成，找到 {len(ready)} 支蓄勢待發')
+
+    if ready:
+        ready.sort(key=lambda x: x['dist_pct'])
+        lines = ['🔍 今日蓄勢待發偵測', '━━━━━━━━━━━━']
+        for r in ready[:15]:
+            shrink_tag = ' 📉量縮' if r['vol_shrink'] else ''
+            lines.append(
+                f"⚡ {r['code']} {r['name']}\n"
+                f"   現{r['close']} → 前高{r['recent_high']}（差{r['dist_pct']}%）{shrink_tag}\n"
+                f"   MA多排 MACD:{r['macd_dif']:+.1f} 第一攻{r['first_wave_pct']}%"
+            )
+        lines.append('━━━━━━━━━━━━')
+        lines.append(f'共 {len(ready)} 支符合，已自動設突破警報 🔔')
+        lines.append('突破時會即時通知大人進場！')
+        push_owner('\n'.join(lines))
+    else:
+        push_owner('🔍 今日蓄勢待發掃描完成\n暫無符合條件的股票（均線多排+量縮+接近前高）')
+
 def taiex_quote():
     """加權指數（Fugle 代碼 IX0001）"""
     q = fugle_quote('IX0001')
@@ -231,7 +514,28 @@ SYSTEM_PROMPT = """你是JV大人的私人股票AI顧問「比董」，透過LIN
 【風格】繁體中文、直接給重點、300字內、適當emoji、給具體建議
 【台股】紅漲綠跌、漲跌停±10%、09:00-13:30
 【美股時間】台灣時間22:30開盤~隔日04:00收盤（系統已標示是否盤中，不要說查不到）
-【指令】持股/大盤/晨報/清除
+
+【你的真實能力 — 絕對不要說你做不到】
+• 你可以抓 Fugle 即時報價（現價/漲跌/成交量）
+• 你可以抓 Fugle 歷史日K線（60~120天），計算MA、三角收斂、支撐壓力
+• 你可以分析用戶傳來的K線截圖（有Claude Vision能力）
+• 你可以設定價格警報並真正寫入資料庫（盤中每分鐘監控）
+• 你可以自動偵測三角收斂的上下軌並設定突破/跌破警報
+• 每天09:30自動掃描熱門股100支，找出「蓄勢待發」的股票（均線多排+量縮+接近前高），自動設突破警報
+
+【快捷指令（系統自動處理，不走AI）】
+• 持股/大盤/晨報/清除
+• 盯著XXXX — 自動偵測三角收斂+設警報
+• 分析XXXX — 技術速覽（報價+MA+三角收斂）
+• XXXX 突破 XX元 — 設定向上突破警報
+• XXXX 跌破 XX元 — 設定向下跌破警報
+• 停止訂 XXXX — 刪除該股警報
+• 警報清單 — 查看所有警報
+• 傳圖片 — AI分析K線截圖
+• 掃描 — 手動觸發蓄勢待發掃描（每天09:30也會自動跑）
+
+【重要】遇到用戶請你「盯著」「監控」某支股票時，不要說你做不到，引導他直接打「盯著XXXX」。
+遇到用戶傳K線截圖時，你會直接看到圖片內容進行分析。
 投資有風險，建議僅供參考。"""
 
 # ══════════════════════════════════════════════════════
@@ -280,6 +584,55 @@ def chat_ai(uid, msg):
             d = '跌至' if a.get('direction')=='below' else '漲至'
             lines.append(f"• {a['code']} {d} {a.get('alert_price','')} {a.get('memo','')}")
         return '\n'.join(lines)
+
+    # 手動觸發蓄勢待發掃描
+    if msg in ['掃描','掃描蓄勢','找突破','找股票']:
+        threading.Thread(target=daily_breakout_scan, daemon=True).start()
+        return '🔍 蓄勢待發掃描開始！\n掃描今日成交量前100名，約需3~5分鐘\n完成後會自動推送結果 📊'
+
+    # 盯著 / 監控三角收斂：「盯著1101三角突破」「盯1101」
+    import re as _re
+    watch_match = _re.match(r'(?:盯著|盯|監控|觀察|看著)\s*(\d{4})', msg)
+    if watch_match:
+        code = watch_match.group(1)
+        return auto_watch_triangle(code)
+
+    # 分析某支股票：「分析1101」「技術分析2330」
+    analyze_match = _re.match(r'(?:分析|技術分析|看一下)\s*(\d{4})', msg)
+    if analyze_match:
+        code = analyze_match.group(1)
+        q = fugle_quote(code)
+        ma = fugle_ma(code)
+        tri = detect_triangle(code)
+        name = q.get('name', code) if q else code
+        lines = [f'📊 {code} {name} 技術速覽']
+        if q and q.get('price'):
+            lines.append(f"現價 {q['price']}（{'🔴' if q['chg']>=0 else '🟢'}{q['pct']:+.1f}%）")
+            lines.append(f"今日 {q.get('open','-')}/{q.get('high','-')}/{q.get('low','-')} 量{q.get('vol',0):,}")
+        if ma:
+            lines.append(f"MA5={ma.get('ma5','-')} MA10={ma.get('ma10','-')} MA20={ma.get('ma20','-')}")
+        if tri:
+            lines.append(f"\n📐 三角收斂：上軌{tri['upper']} 下軌{tri['lower']}（幅度{tri['spread']}%）")
+            lines.append(f"狀態：{tri['status']}")
+        else:
+            lines.append('\n📐 無明顯三角收斂')
+        return '\n'.join(lines)
+
+    # 設定突破價格警報：「1101 突破 36.5 通知」「2330 跌破 950 通知」
+    price_alert_match = _re.match(r'(\d{4})\s*(?:突破|漲到|漲至)\s*([\d.]+)', msg)
+    price_drop_match  = _re.match(r'(\d{4})\s*(?:跌破|跌到|跌至)\s*([\d.]+)', msg)
+    if price_alert_match:
+        code, price = price_alert_match.group(1), float(price_alert_match.group(2))
+        q = fugle_quote(code)
+        name = q.get('name', code) if q else code
+        sb_upsert('stock_alert', {'code': code, 'alert_price': price, 'direction': 'above', 'memo': f'突破{price}', 'active': True})
+        return f'✅ 已設定：{code} {name} 突破 {price} 元時通知\n現價：{q.get("price","-")}'
+    if price_drop_match:
+        code, price = price_drop_match.group(1), float(price_drop_match.group(2))
+        q = fugle_quote(code)
+        name = q.get('name', code) if q else code
+        sb_upsert('stock_alert', {'code': code, 'alert_price': price, 'direction': 'below', 'memo': f'跌破{price}', 'active': True})
+        return f'✅ 已設定：{code} {name} 跌破 {price} 元時通知\n現價：{q.get("price","-")}'
 
     if msg.startswith('記住：') or msg.startswith('記住:'):
         content = msg.split('：',1)[-1].split(':',1)[-1].strip()
@@ -438,6 +791,7 @@ def morning_briefing():
 
 _sent_morning = set()
 _sent_health  = set()
+_sent_scan    = set()
 _alert_fired  = set()
 _self_url     = None   # 啟動後自動偵測
 
@@ -522,6 +876,11 @@ def scheduler():
                 _sent_morning.add(today)
                 try: push_owner(morning_briefing())
                 except Exception as e: print(f'[晨報] {e}')
+
+            # 每日 09:30 蓄勢待發掃描（平日開盤後30分鐘）
+            if hhmm == '09:30' and now.weekday() < 5 and today not in _sent_scan:
+                _sent_scan.add(today)
+                threading.Thread(target=daily_breakout_scan, daemon=True).start()
 
             # 價格警報（盤中每次檢查）
             if 9 <= now.hour <= 13 and now.weekday() < 5:
