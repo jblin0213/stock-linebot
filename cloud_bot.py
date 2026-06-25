@@ -265,6 +265,17 @@ def auto_watch_triangle(code):
     ]
     return '\n'.join(lines)
 
+def estimate_volume(current_vol):
+    """根據目前成交量推算全天預估量（台股09:00~13:30=270分鐘）"""
+    now = datetime.now(TW_TZ)
+    h, m = now.hour, now.minute
+    elapsed = (h - 9) * 60 + m  # 開盤後已過幾分鐘
+    if elapsed <= 0:
+        return 0
+    if elapsed >= 270:
+        return current_vol
+    return int(current_vol * 270 / elapsed)
+
 def _ema(data, period):
     k = 2 / (period + 1)
     val = data[0]
@@ -332,6 +343,12 @@ def detect_breakout_ready(code):
     q = fugle_quote(code)
     name = q.get('name', code) if q else code
 
+    # 7. 預估量 vs 昨日量
+    realtime_vol = q.get('vol', 0) if q else 0
+    est_vol = estimate_volume(realtime_vol)
+    yesterday_vol = volumes[-1] if volumes else 0
+    est_vol_ratio = round(est_vol / yesterday_vol, 1) if yesterday_vol > 0 else 0
+
     return {
         'code': code, 'name': name,
         'close': current, 'recent_high': recent_high,
@@ -340,7 +357,10 @@ def detect_breakout_ready(code):
         'ma8': round(ma8, 2), 'ma21': round(ma21, 2), 'ma55': round(ma55, 2),
         'macd_dif': round(dif, 2),
         'first_wave_pct': round(first_wave, 1),
-        'today_vol': today_vol,
+        'today_vol': realtime_vol,
+        'est_vol': est_vol,
+        'yesterday_vol': yesterday_vol,
+        'est_vol_ratio': est_vol_ratio,
     }
 
 def daily_breakout_scan():
@@ -402,14 +422,22 @@ def daily_breakout_scan():
     print(f'[掃描] 完成，找到 {len(ready)} 支蓄勢待發')
 
     if ready:
-        ready.sort(key=lambda x: x['dist_pct'])
+        # 預估量>昨量的排前面（放量突破更有意義）
+        ready.sort(key=lambda x: (-1 if x['est_vol_ratio'] >= 1 else 0, x['dist_pct']))
         lines = ['🔍 今日蓄勢待發偵測', '━━━━━━━━━━━━']
         for r in ready[:15]:
             shrink_tag = ' 📉量縮' if r['vol_shrink'] else ''
+            # 預估量標記
+            if r['est_vol_ratio'] >= 1.5:
+                vol_tag = f" 🔥預估量{r['est_vol_ratio']}倍"
+            elif r['est_vol_ratio'] >= 1:
+                vol_tag = f" 📈預估量{r['est_vol_ratio']}倍"
+            else:
+                vol_tag = f" 預估量{r['est_vol_ratio']}倍"
             lines.append(
                 f"⚡ {r['code']} {r['name']}\n"
                 f"   現{r['close']} → 前高{r['recent_high']}（差{r['dist_pct']}%）{shrink_tag}\n"
-                f"   MA多排 MACD:{r['macd_dif']:+.1f} 第一攻{r['first_wave_pct']}%"
+                f"   MA多排 MACD:{r['macd_dif']:+.1f}{vol_tag}"
             )
         lines.append('━━━━━━━━━━━━')
         lines.append(f'共 {len(ready)} 支符合，已自動設突破警報 🔔')
@@ -608,7 +636,13 @@ def chat_ai(uid, msg):
         lines = [f'📊 {code} {name} 技術速覽']
         if q and q.get('price'):
             lines.append(f"現價 {q['price']}（{'🔴' if q['chg']>=0 else '🟢'}{q['pct']:+.1f}%）")
-            lines.append(f"今日 {q.get('open','-')}/{q.get('high','-')}/{q.get('low','-')} 量{q.get('vol',0):,}")
+            cur_vol = q.get('vol', 0)
+            est = estimate_volume(cur_vol)
+            candles = fugle_candles(code, 5)
+            yd_vol = candles[-1]['volume'] if candles else 0
+            est_ratio = round(est / yd_vol, 1) if yd_vol > 0 else 0
+            vol_icon = '🔥' if est_ratio >= 1.5 else ('📈' if est_ratio >= 1 else '📉')
+            lines.append(f"今量 {cur_vol:,} → 預估量 {est:,}（{vol_icon}{est_ratio}倍昨量）")
         if ma:
             lines.append(f"MA5={ma.get('ma5','-')} MA10={ma.get('ma10','-')} MA20={ma.get('ma20','-')}")
         if tri:
