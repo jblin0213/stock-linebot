@@ -446,6 +446,120 @@ def daily_breakout_scan():
     else:
         push_owner('🔍 今日蓄勢待發掃描完成\n暫無符合條件的股票（均線多排+量縮+接近前高）')
 
+def daily_portfolio_report():
+    """收盤後推送持股損益日報"""
+    print('[日報] 開始計算持股損益...')
+    holdings = sb_get('stock_portfolio', 'select=*')
+    if not holdings:
+        push_owner('📋 持股日報：目前沒有持股資料')
+        return
+
+    lines = ['📋 今日持股損益日報', '━━━━━━━━━━━━']
+    total_cost = 0
+    total_market = 0
+
+    for h in holdings:
+        code = h['code']
+        q = fugle_quote(code)
+        if not q or not q.get('price'):
+            continue
+        name = q.get('name', h.get('name', code))
+        price = q['price']
+        avg = float(h.get('avg_price', 0))
+        shares = int(h.get('shares', 0))
+        if avg <= 0 or shares <= 0:
+            continue
+
+        cost = avg * shares
+        market = price * shares
+        pnl = market - cost
+        pnl_pct = (price - avg) / avg * 100
+        chg_pct = q.get('pct', 0)
+        total_cost += cost
+        total_market += market
+
+        if pnl >= 0:
+            icon = '🔴' if chg_pct >= 0 else '⚪'
+        else:
+            icon = '🟢' if chg_pct < 0 else '⚪'
+
+        lines.append(
+            f"{icon} {code} {name}\n"
+            f"   均{avg} → 現{price}（今{chg_pct:+.1f}%）\n"
+            f"   損益 {pnl:+,.0f} ({pnl_pct:+.1f}%)"
+        )
+
+    total_pnl = total_market - total_cost
+    total_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+    lines.append('━━━━━━━━━━━━')
+    lines.append(f"💰 總損益：{total_pnl:+,.0f} 元（{total_pct:+.1f}%）")
+
+    # 個別持股風險提醒
+    warnings = []
+    for h in holdings:
+        code = h['code']
+        avg = float(h.get('avg_price', 0))
+        q = fugle_quote(code)
+        if not q or not q.get('price') or avg <= 0:
+            continue
+        price = q['price']
+        pnl_pct = (price - avg) / avg * 100
+        name = q.get('name', h.get('name', code))
+
+        # 虧損超過 5% 提醒
+        if pnl_pct <= -5:
+            warnings.append(f"⚠️ {code} {name} 虧損 {pnl_pct:.1f}%，注意停損")
+        # 獲利超過 10% 提醒
+        elif pnl_pct >= 10:
+            warnings.append(f"💎 {code} {name} 獲利 {pnl_pct:.1f}%，可考慮分批停利")
+
+    if warnings:
+        lines.append('')
+        lines.extend(warnings)
+
+    push_owner('\n'.join(lines))
+    print(f'[日報] 完成，共 {len(holdings)} 支持股')
+
+
+def setup_portfolio_alerts():
+    """根據持股自動設定跌破支撐警報"""
+    print('[防守] 設定持股跌破警報...')
+    holdings = sb_get('stock_portfolio', 'select=*')
+    count = 0
+    for h in holdings:
+        code = h['code']
+        avg = float(h.get('avg_price', 0))
+        if avg <= 0:
+            continue
+
+        candles = fugle_candles(code, 30)
+        if len(candles) < 10:
+            continue
+
+        closes = [c['close'] for c in candles]
+        lows = [c['low'] for c in candles]
+
+        # 支撐位 = 近 20 日最低點
+        support = min(lows[-20:]) if len(lows) >= 20 else min(lows)
+        # MA21
+        ma21 = sum(closes[-21:]) / min(len(closes), 21)
+
+        # 取較高的那個當防守價（跌破 = 趨勢轉弱）
+        guard_price = round(max(support, ma21 * 0.98), 2)
+
+        sb_upsert('stock_alert', {
+            'code': code,
+            'alert_price': guard_price,
+            'direction': 'below',
+            'memo': f'⚠️ 跌破支撐{guard_price}！考慮停損',
+            'active': True,
+        })
+        count += 1
+        print(f'  {code} 防守價 {guard_price}')
+
+    print(f'[防守] 共設 {count} 支跌破警報')
+
+
 def taiex_quote():
     """加權指數（Fugle 代碼 IX0001）"""
     q = fugle_quote('IX0001')
@@ -559,6 +673,7 @@ SYSTEM_PROMPT = """你是JV大人的私人股票AI顧問「比董」，透過LIN
 • XXXX 跌破 XX元 — 設定向下跌破警報
 • 停止訂 XXXX — 刪除該股警報
 • 警報清單 — 查看所有警報
+• 損益 — 即時持股損益報告
 • 傳圖片 — AI分析K線截圖
 • 掃描 — 手動觸發蓄勢待發掃描（每天09:30也會自動跑）
 
@@ -612,6 +727,11 @@ def chat_ai(uid, msg):
             d = '跌至' if a.get('direction')=='below' else '漲至'
             lines.append(f"• {a['code']} {d} {a.get('alert_price','')} {a.get('memo','')}")
         return '\n'.join(lines)
+
+    # 手動查看持股損益
+    if msg in ['損益','持股','我的持股','損益報告','日報']:
+        threading.Thread(target=daily_portfolio_report, daemon=True).start()
+        return '📋 損益報告計算中，稍後推送！'
 
     # 手動觸發蓄勢待發掃描
     if msg in ['掃描','掃描蓄勢','找突破','找股票']:
@@ -826,6 +946,8 @@ def morning_briefing():
 _sent_morning = set()
 _sent_health  = set()
 _sent_scan    = set()
+_sent_guard   = set()
+_sent_report  = set()
 _alert_fired  = set()
 _self_url     = None   # 啟動後自動偵測
 
@@ -915,6 +1037,16 @@ def scheduler():
             if hhmm == '09:30' and now.weekday() < 5 and today not in _sent_scan:
                 _sent_scan.add(today)
                 threading.Thread(target=daily_breakout_scan, daemon=True).start()
+
+            # 每日 09:35 自動設定持股跌破支撐警報
+            if hhmm == '09:35' and now.weekday() < 5 and today not in _sent_guard:
+                _sent_guard.add(today)
+                threading.Thread(target=setup_portfolio_alerts, daemon=True).start()
+
+            # 每日 13:35 收盤損益日報
+            if hhmm == '13:35' and now.weekday() < 5 and today not in _sent_report:
+                _sent_report.add(today)
+                threading.Thread(target=daily_portfolio_report, daemon=True).start()
 
             # 價格警報（盤中每次檢查）
             if 9 <= now.hour <= 13 and now.weekday() < 5:
